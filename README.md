@@ -32,6 +32,15 @@ Optional:
 - `OPENAI_API_KEY` (required for voice transcription)
 - `OPENAI_TRANSCRIPTION_MODEL` (default: `gpt-4o-mini-transcribe`)
 
+Codex CLI config (optional): `~/.codex/config.toml`
+```toml
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+network_access = true
+```
+
 ## Commands
 - `/start`: confirm connectivity
 - `/reset`: reset the Codex session state
