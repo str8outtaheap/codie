@@ -62,6 +62,7 @@ class BotState:
     has_session: bool = False
     resume_token: str | None = None
     resume_map: dict[str, str] = field(default_factory=dict)
+    pin: str | None = None
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -199,15 +200,20 @@ def format_action_line(action: ActionState) -> str:
     return f"{status} {format_action_title(action)}"
 
 
-def render_progress(tracker: ProgressTracker, *, elapsed_s: float, label: str) -> str:
+def render_progress(
+    tracker: ProgressTracker, *, elapsed_s: float, label: str, pin: str | None = None
+) -> str:
     header = f"{label} {format_elapsed(elapsed_s)}"
+    lines: list[str] = [header]
+    if pin:
+        lines.append(f"pin: {pin}")
     actions = tracker.snapshot()
     if PROGRESS_MAX_ACTIONS > 0:
         actions = actions[-PROGRESS_MAX_ACTIONS:]
     body_lines = [format_action_line(action) for action in actions]
     if not body_lines:
-        return header
-    return f"{header}\n\n" + "\n".join(body_lines)
+        return "\n".join(lines)
+    return "\n\n".join(["\n".join(lines), "\n".join(body_lines)])
 
 
 # Progress parsing
@@ -826,7 +832,32 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ]
     if state.resume_token:
         lines.append(f"- resume_line: {format_resume_line(state.resume_token)}")
+    if state.pin:
+        lines.append(f"- pin: {state.pin}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def pin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    state: BotState = context.application.bot_data["state"]
+    text = " ".join(context.args).strip()
+    if not text:
+        if state.pin:
+            await update.message.reply_text(f"pin: {state.pin}")
+        else:
+            await update.message.reply_text("pin: (empty)")
+        return
+    state.pin = shorten(text, 120)
+    await update.message.reply_text(f"pin set: {state.pin}")
+
+
+async def unpin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    state: BotState = context.application.bot_data["state"]
+    state.pin = None
+    await update.message.reply_text("pin cleared.")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -899,7 +930,12 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         progress_message_id = await send_progress_message(
             context.application,
-            render_progress(progress_tracker, elapsed_s=0.0, label=progress_label),
+            render_progress(
+                progress_tracker,
+                elapsed_s=0.0,
+                label=progress_label,
+                pin=state.pin,
+            ),
             chat_id=chat_id,
             reply_to_message_id=update.message.message_id,
         )
@@ -914,7 +950,10 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not force and now - last_edit_at < PROGRESS_EDIT_MIN_INTERVAL_S:
             return
         rendered = render_progress(
-            progress_tracker, elapsed_s=now - started_at, label=progress_label
+            progress_tracker,
+            elapsed_s=now - started_at,
+            label=progress_label,
+            pin=state.pin,
         )
         if rendered == last_rendered:
             return
@@ -1016,6 +1055,8 @@ def main() -> None:
     application.add_handler(CommandHandler("pwd", pwd_cmd))
     application.add_handler(CommandHandler("cd", cd_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("pin", pin_cmd))
+    application.add_handler(CommandHandler("unpin", unpin_cmd))
     application.add_handler(
         MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, on_message)
     )
