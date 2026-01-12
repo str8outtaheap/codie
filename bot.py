@@ -860,6 +860,53 @@ async def unpin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pin cleared.")
 
 
+async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    if update.message is None:
+        return
+    state: BotState = context.application.bot_data["state"]
+    cmd = " ".join(context.args).strip()
+    if not cmd:
+        await update.message.reply_text("Usage: /run <command>")
+        return
+    if state.run_lock.locked():
+        await send_codex_message(
+            context.application,
+            "Codex is busy. Please wait for the current run to finish.",
+            chat_id=int(update.effective_chat.id),
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            cwd=state.workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Failed to start: {exc}")
+        return
+    stdout, stderr = await proc.communicate()
+    out = stdout.decode("utf-8", errors="replace").strip() if stdout else ""
+    err = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+    parts: list[str] = []
+    parts.append(f"$ {cmd}")
+    if out:
+        parts.append(out)
+    if err:
+        parts.append(err)
+    parts.append(f"(exit {proc.returncode})")
+    message = "\n".join(parts)
+    await send_codex_message(
+        context.application,
+        message,
+        chat_id=int(update.effective_chat.id),
+        reply_to_message_id=update.message.message_id,
+    )
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
@@ -1057,6 +1104,7 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("pin", pin_cmd))
     application.add_handler(CommandHandler("unpin", unpin_cmd))
+    application.add_handler(CommandHandler("run", run_cmd))
     application.add_handler(
         MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, on_message)
     )
