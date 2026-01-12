@@ -779,6 +779,15 @@ def strip_resume_lines(text: str) -> str:
 def format_resume_line(token: str) -> str:
     return f"`codex resume {token}`"
 
+def append_resume_line(text: str, token: str | None) -> str:
+    if not token:
+        return text
+    if not text:
+        return format_resume_line(token)
+    if RESUME_RE.search(text):
+        return text
+    return f"{text.rstrip()}\n\n{format_resume_line(token)}"
+
 # Handlers
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
@@ -1072,6 +1081,7 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         message = result.message
         if result.error:
             message = f"{message}\n\n{result.error}"
+        message = append_resume_line(message, state.resume_token)
         await send_codex_message(
             context.application,
             message or "",
@@ -1080,9 +1090,10 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     if result.error:
+        message = append_resume_line(result.error, state.resume_token)
         await send_codex_message(
             context.application,
-            result.error,
+            message,
             chat_id=chat_id,
             reply_to_message_id=update.message.message_id,
         )
