@@ -44,6 +44,7 @@ OPENAI_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".codie")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
+PROJECTS_PATH = os.path.join(STATE_DIR, "projects.json")
 
 SYSTEM_HINT = (
     "You are Codex running in a Telegram bridge. "
@@ -62,6 +63,7 @@ class BotState:
     has_session: bool = False
     resume_token: str | None = None
     resume_map: dict[str, str] = field(default_factory=dict)
+    project_map: dict[str, str] = field(default_factory=dict)
     pin: str | None = None
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -485,6 +487,30 @@ def remember_resume_workdir(state: BotState, token: str) -> None:
     save_resume_map(state.resume_map)
 
 
+# Project aliases
+def load_projects() -> dict[str, str]:
+    try:
+        with open(PROJECTS_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for key, value in payload.items():
+        if isinstance(key, str) and isinstance(value, str) and value:
+            cleaned[key] = value
+    return cleaned
+
+
+def save_projects(projects: dict[str, str]) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp_path = f"{PROJECTS_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(projects, handle)
+    os.replace(tmp_path, PROJECTS_PATH)
+
+
 # Telegram I/O
 async def send_chunked(
     application,
@@ -846,6 +872,64 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines))
 
 
+async def proj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    if update.message is None:
+        return
+    state: BotState = context.application.bot_data["state"]
+    args = context.args
+    if not args:
+        if not state.project_map:
+            await update.message.reply_text("projects: (empty)")
+            return
+        items = [f"{name} -> {path}" for name, path in sorted(state.project_map.items())]
+        await update.message.reply_text("projects:\n" + "\n".join(items))
+        return
+    if args[0] == "rm":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /proj rm <name>")
+            return
+        name = args[1]
+        if name in state.project_map:
+            state.project_map.pop(name, None)
+            save_projects(state.project_map)
+            await update.message.reply_text(f"removed: {name}")
+            return
+        await update.message.reply_text(f"no such project: {name}")
+        return
+
+    name = args[0]
+    if len(args) == 1:
+        path = state.project_map.get(name)
+        if not path:
+            await update.message.reply_text(f"no such project: {name}")
+            return
+        if not os.path.isdir(path):
+            await update.message.reply_text(f"missing directory: {path}")
+            return
+        state.workdir = path
+        if state.resume_token:
+            remember_resume_workdir(state, state.resume_token)
+        await update.message.reply_text(state.workdir)
+        return
+
+    raw_path = " ".join(args[1:]).strip()
+    if not raw_path:
+        await update.message.reply_text("Usage: /proj <name> <path>")
+        return
+    path = resolve_workdir(raw_path, state.workdir)
+    if not path or not os.path.isdir(path):
+        await update.message.reply_text(f"No such directory: {path or raw_path}")
+        return
+    state.project_map[name] = path
+    save_projects(state.project_map)
+    state.workdir = path
+    if state.resume_token:
+        remember_resume_workdir(state, state.resume_token)
+    await update.message.reply_text(state.workdir)
+
+
 async def pin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
@@ -1107,12 +1191,14 @@ def main() -> None:
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     state = BotState()
     state.resume_map = load_resume_map()
+    state.project_map = load_projects()
     application.bot_data["state"] = state
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("pwd", pwd_cmd))
     application.add_handler(CommandHandler("cd", cd_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("proj", proj_cmd))
     application.add_handler(CommandHandler("pin", pin_cmd))
     application.add_handler(CommandHandler("unpin", unpin_cmd))
     application.add_handler(CommandHandler("run", run_cmd))
