@@ -5,7 +5,7 @@ Telegram bot bridge for the [Codex CLI](https://developers.openai.com/codex/cli)
 ## Features
 - Single authorized chat controls a stateful Codex session
 - Live progress updates (commands/tools/files)
-- `/cd`, `/pwd`, `/status`, `/reset`
+- `/cd`, `/pwd`, `/status`, `/reset`, `/pin`, `/unpin`, `/run`
 - Optional voice note transcription
 - Resume sessions with `codex resume <token>` and restore last workdir
 
@@ -48,6 +48,10 @@ network_access = true
 - `/cd <path>`: change working directory (supports relative paths)
 - `/status`: show session state and working directory (includes resume token)
   - Resume token can be used in a message: `codex resume <token>`
+- `/pin <text>`: set a short context note shown during runs
+- `/pin`: show current pin
+- `/unpin`: clear the pin
+- `/run <command>`: run a shell command in the current working directory
 
 ## Voice Notes
 If enabled, voice notes are transcribed via OpenAI and sent to Codex as text.
