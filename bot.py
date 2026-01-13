@@ -1,9 +1,12 @@
 import asyncio
 import json
 import os
+import posixpath
 import re
+import shlex
 import textwrap
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
@@ -45,6 +48,7 @@ OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".codie")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 PROJECTS_PATH = os.path.join(STATE_DIR, "projects.json")
+MACHINES_PATH = os.path.join(STATE_DIR, "machines.toml")
 
 SYSTEM_HINT = (
     "You are Codex running in a Telegram bridge. "
@@ -64,6 +68,9 @@ class BotState:
     resume_token: str | None = None
     resume_map: dict[str, str] = field(default_factory=dict)
     project_map: dict[str, str] = field(default_factory=dict)
+    machines: dict[str, dict[str, str]] = field(default_factory=dict)
+    active_machine: str = "local"
+    machine_workdir: dict[str, str] = field(default_factory=dict)
     pin: str | None = None
     run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -203,10 +210,17 @@ def format_action_line(action: ActionState) -> str:
 
 
 def render_progress(
-    tracker: ProgressTracker, *, elapsed_s: float, label: str, pin: str | None = None
+    tracker: ProgressTracker,
+    *,
+    elapsed_s: float,
+    label: str,
+    pin: str | None = None,
+    host: str | None = None,
 ) -> str:
     header = f"{label} {format_elapsed(elapsed_s)}"
     lines: list[str] = [header]
+    if host:
+        lines.append(f"host: {host}")
     if pin:
         lines.append(f"pin: {pin}")
     actions = tracker.snapshot()
@@ -354,8 +368,14 @@ async def run_codex(
     resume_last: bool,
     workdir: str,
     on_progress: Callable[[ProgressUpdate], Awaitable[None]] | None = None,
+    ssh_host: str | None = None,
 ) -> CodexRunResult:
-    cmd = build_codex_cmd(resume_token, resume_last, workdir)
+    base_cmd = build_codex_cmd(resume_token, resume_last, workdir)
+    if ssh_host:
+        remote_cmd = shlex.join(base_cmd)
+        cmd = ["ssh", "-T", ssh_host, "--", "bash", "-lc", remote_cmd]
+    else:
+        cmd = base_cmd
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -483,7 +503,8 @@ def save_resume_map(resume_map: dict[str, str]) -> None:
 
 
 def remember_resume_workdir(state: BotState, token: str) -> None:
-    state.resume_map[token] = state.workdir
+    key = f"{state.active_machine}:{token}"
+    state.resume_map[key] = state.workdir
     save_resume_map(state.resume_map)
 
 
@@ -511,6 +532,60 @@ def save_projects(projects: dict[str, str]) -> None:
     os.replace(tmp_path, PROJECTS_PATH)
 
 
+def project_key(state: BotState, name: str) -> str:
+    return f"{state.active_machine}:{name}"
+
+
+def _toml_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def load_machines() -> dict[str, dict[str, str]]:
+    try:
+        with open(MACHINES_PATH, "rb") as handle:
+            payload = tomllib.load(handle)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    raw = payload.get("machines")
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, str]] = {}
+    for name, cfg in raw.items():
+        if not isinstance(name, str) or not isinstance(cfg, dict):
+            continue
+        host = cfg.get("host")
+        if not isinstance(host, str) or not host:
+            continue
+        workdir = cfg.get("workdir")
+        entry = {"host": host}
+        if isinstance(workdir, str) and workdir:
+            entry["workdir"] = workdir
+        cleaned[name] = entry
+    return cleaned
+
+
+def save_machines(machines: dict[str, dict[str, str]]) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lines: list[str] = []
+    for name in sorted(machines.keys()):
+        cfg = machines[name]
+        host = cfg.get("host")
+        if not isinstance(host, str) or not host:
+            continue
+        lines.append(f"[machines.{name}]")
+        lines.append(f"host = {_toml_string(host)}")
+        workdir = cfg.get("workdir")
+        if isinstance(workdir, str) and workdir:
+            lines.append(f"workdir = {_toml_string(workdir)}")
+        lines.append("")
+    tmp_path = f"{MACHINES_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).strip() + "\n")
+    os.replace(tmp_path, MACHINES_PATH)
+
+
 # Telegram I/O
 async def send_chunked(
     application,
@@ -535,6 +610,47 @@ def resolve_workdir(target: str, base: str) -> str | None:
         target_path = os.path.abspath(os.path.join(base, target_path))
     return target_path
 
+
+def resolve_remote_workdir(target: str, base: str) -> str:
+    if target.startswith("/") or target.startswith("~"):
+        return target
+    if base.endswith("/"):
+        return base + target
+    return posixpath.join(base, target)
+
+
+def resolve_workdir_for_machine(target: str, base: str, *, remote: bool) -> str:
+    if remote:
+        return resolve_remote_workdir(target, base)
+    return resolve_workdir(target, base) or target
+
+
+def set_workdir(state: BotState, path: str) -> None:
+    state.workdir = path
+    state.machine_workdir[state.active_machine] = path
+
+
+def get_machine_workdir(state: BotState, name: str) -> str | None:
+    if name in state.machine_workdir:
+        return state.machine_workdir.get(name)
+    cfg = state.machines.get(name)
+    if isinstance(cfg, dict):
+        workdir = cfg.get("workdir")
+        if isinstance(workdir, str) and workdir:
+            return workdir
+    return None
+
+
+def get_machine_host(state: BotState, name: str) -> str | None:
+    if name == "local":
+        return None
+    cfg = state.machines.get(name)
+    if not isinstance(cfg, dict):
+        return None
+    host = cfg.get("host")
+    if isinstance(host, str) and host:
+        return host
+    return None
 
 async def send_markdown_message(
     application,
@@ -845,9 +961,16 @@ async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not target:
         await update.message.reply_text("Usage: /cd <path>")
         return
-    target_path = resolve_workdir(target, state.workdir)
+    remote = state.active_machine != "local"
+    target_path = resolve_workdir_for_machine(target, state.workdir, remote=remote)
+    if remote:
+        set_workdir(state, target_path)
+        if state.resume_token:
+            remember_resume_workdir(state, state.resume_token)
+        await update.message.reply_text(state.workdir)
+        return
     if target_path and os.path.isdir(target_path):
-        state.workdir = target_path
+        set_workdir(state, target_path)
         if state.resume_token:
             remember_resume_workdir(state, state.resume_token)
         await update.message.reply_text(state.workdir)
@@ -862,9 +985,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = [
         "Status:",
         f"- has_session: {state.has_session}",
+        f"- machine: {state.active_machine}",
         f"- workdir: {state.workdir}",
         f"- resume: {state.resume_token or 'none'}",
     ]
+    host = get_machine_host(state, state.active_machine)
+    if host:
+        lines.append(f"- host: {host}")
     if state.resume_token:
         lines.append(f"- resume_line: {format_resume_line(state.resume_token)}")
     if state.pin:
@@ -880,10 +1007,15 @@ async def proj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.application.bot_data["state"]
     args = context.args
     if not args:
-        if not state.project_map:
+        prefix = f"{state.active_machine}:"
+        items = [
+            f"{key[len(prefix):]} -> {path}"
+            for key, path in sorted(state.project_map.items())
+            if key.startswith(prefix)
+        ]
+        if not items:
             await update.message.reply_text("projects: (empty)")
             return
-        items = [f"{name} -> {path}" for name, path in sorted(state.project_map.items())]
         await update.message.reply_text("projects:\n" + "\n".join(items))
         return
     if args[0] == "rm":
@@ -891,8 +1023,9 @@ async def proj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Usage: /proj rm <name>")
             return
         name = args[1]
-        if name in state.project_map:
-            state.project_map.pop(name, None)
+        key = project_key(state, name)
+        if key in state.project_map:
+            state.project_map.pop(key, None)
             save_projects(state.project_map)
             await update.message.reply_text(f"removed: {name}")
             return
@@ -901,14 +1034,16 @@ async def proj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     name = args[0]
     if len(args) == 1:
-        path = state.project_map.get(name)
+        key = project_key(state, name)
+        path = state.project_map.get(key)
         if not path:
             await update.message.reply_text(f"no such project: {name}")
             return
-        if not os.path.isdir(path):
+        remote = state.active_machine != "local"
+        if not remote and not os.path.isdir(path):
             await update.message.reply_text(f"missing directory: {path}")
             return
-        state.workdir = path
+        set_workdir(state, path)
         if state.resume_token:
             remember_resume_workdir(state, state.resume_token)
         await update.message.reply_text(state.workdir)
@@ -918,16 +1053,56 @@ async def proj_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not raw_path:
         await update.message.reply_text("Usage: /proj <name> <path>")
         return
-    path = resolve_workdir(raw_path, state.workdir)
-    if not path or not os.path.isdir(path):
+    remote = state.active_machine != "local"
+    path = resolve_workdir_for_machine(raw_path, state.workdir, remote=remote)
+    if not remote and (not path or not os.path.isdir(path)):
         await update.message.reply_text(f"No such directory: {path or raw_path}")
         return
-    state.project_map[name] = path
+    state.project_map[project_key(state, name)] = path
     save_projects(state.project_map)
-    state.workdir = path
+    set_workdir(state, path)
     if state.resume_token:
         remember_resume_workdir(state, state.resume_token)
     await update.message.reply_text(state.workdir)
+
+
+async def machine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    state: BotState = context.application.bot_data["state"]
+    args = context.args
+    if not args:
+        lines: list[str] = []
+        active = state.active_machine
+        local_prefix = "*" if active == "local" else "-"
+        lines.append(
+            f"{local_prefix} local -> {state.machine_workdir.get('local', DEFAULT_WORKDIR)}"
+        )
+        for name in sorted(state.machines.keys()):
+            cfg = state.machines[name]
+            host = cfg.get("host", "")
+            workdir = get_machine_workdir(state, name) or ""
+            prefix = "*" if name == active else "-"
+            lines.append(f"{prefix} {name} -> {host} {workdir}")
+        await update.message.reply_text("machines:\n" + "\n".join(lines))
+        return
+    if args[0] == "current":
+        await update.message.reply_text(f"machine: {state.active_machine}")
+        return
+
+    name = args[0]
+    if name != "local" and name not in state.machines:
+        await update.message.reply_text(f"no such machine: {name}")
+        return
+    workdir = get_machine_workdir(state, name)
+    if not workdir:
+        await update.message.reply_text(f"missing workdir for machine: {name}")
+        return
+    state.active_machine = name
+    set_workdir(state, workdir)
+    if state.resume_token:
+        remember_resume_workdir(state, state.resume_token)
+    await update.message.reply_text(f"machine: {name}\n{state.workdir}")
 
 
 async def pin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -972,12 +1147,27 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=state.workdir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        ssh_host = get_machine_host(state, state.active_machine)
+        if ssh_host:
+            remote_cmd = f"cd {shlex.quote(state.workdir)} && {cmd}"
+            proc = await asyncio.create_subprocess_exec(
+                "ssh",
+                "-T",
+                ssh_host,
+                "--",
+                "bash",
+                "-lc",
+                remote_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=state.workdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
     except Exception as exc:
         await update.message.reply_text(f"Failed to start: {exc}")
         return
@@ -1055,9 +1245,11 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         stripped_text = "continue"
     resume_token = explicit_resume or (state.resume_token if state.has_session else None)
     if explicit_resume:
-        mapped = state.resume_map.get(explicit_resume)
-        if isinstance(mapped, str) and mapped and os.path.isdir(mapped):
-            state.workdir = mapped
+        key = f"{state.active_machine}:{explicit_resume}"
+        mapped = state.resume_map.get(key)
+        remote = state.active_machine != "local"
+        if isinstance(mapped, str) and mapped and (remote or os.path.isdir(mapped)):
+            set_workdir(state, mapped)
     resume_last = state.has_session and resume_token is None
     started_at = time.monotonic()
     progress_tracker = ProgressTracker()
@@ -1067,6 +1259,7 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     progress_queue: asyncio.Queue[ProgressUpdate] | None = None
     progress_task: asyncio.Task[None] | None = None
     progress_message_id = None
+    host_label = get_machine_host(state, state.active_machine)
     try:
         progress_message_id = await send_progress_message(
             context.application,
@@ -1075,6 +1268,7 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 elapsed_s=0.0,
                 label=progress_label,
                 pin=state.pin,
+                host=host_label,
             ),
             chat_id=chat_id,
             reply_to_message_id=update.message.message_id,
@@ -1094,6 +1288,7 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             elapsed_s=now - started_at,
             label=progress_label,
             pin=state.pin,
+            host=host_label,
         )
         if rendered == last_rendered:
             return
@@ -1140,12 +1335,14 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if progress_message_id is not None:
         progress_queue = asyncio.Queue(maxsize=200)
         progress_task = asyncio.create_task(progress_loop())
+    ssh_host = get_machine_host(state, state.active_machine)
     result = await run_codex(
         prompt,
         resume_token=resume_token,
         resume_last=resume_last,
         workdir=state.workdir,
         on_progress=on_progress if progress_message_id is not None else None,
+        ssh_host=ssh_host,
     )
     if progress_task is not None:
         progress_task.cancel()
@@ -1192,6 +1389,12 @@ def main() -> None:
     state = BotState()
     state.resume_map = load_resume_map()
     state.project_map = load_projects()
+    state.machines = load_machines()
+    state.machine_workdir["local"] = DEFAULT_WORKDIR
+    for name, cfg in state.machines.items():
+        workdir = cfg.get("workdir")
+        if isinstance(workdir, str) and workdir:
+            state.machine_workdir[name] = workdir
     application.bot_data["state"] = state
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("reset", reset_cmd))

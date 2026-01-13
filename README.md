@@ -5,7 +5,7 @@ Telegram bot bridge for the [Codex CLI](https://developers.openai.com/codex/cli)
 ## Features
 - Single authorized chat controls a stateful Codex session
 - Live progress updates (commands/tools/files)
-- `/cd`, `/pwd`, `/status`, `/reset`, `/pin`, `/unpin`, `/run`, `/proj`
+- `/cd`, `/pwd`, `/status`, `/reset`, `/pin`, `/unpin`, `/run`, `/proj`, `/machine`
 - Optional voice note transcription
 - Resume sessions with `codex resume <token>` and restore last workdir
 
@@ -48,6 +48,9 @@ network_access = true
 - `/cd <path>`: change working directory (supports relative paths)
 - `/status`: show session state and working directory (includes resume token)
   - Resume token can be used in a message: `codex resume <token>`
+- `/machine`: list machines
+- `/machine <name>`: switch active machine (default is `local`)
+- `/machine current`: show active machine
 - `/proj`: list project aliases
 - `/proj <name>`: switch to a saved project
 - `/proj <name> <path>`: save (and switch to) a project alias
@@ -65,6 +68,28 @@ Resume tokens restore the last known working directory for that session. The map
 
 ## Projects
 Project aliases are stored at `~/.codie/projects.json`.
+
+## Machines
+Codie can run Codex and `/run` on remote machines via SSH (works well with Tailscale).
+Set up aliases in `~/.codie/machines.toml`, then select with `/machine <name>`.
+`local` is the default target.
+
+Example:
+
+```toml
+[machines.laptop]
+host = "laptop"           # can be user@host
+workdir = "/home/me/code"
+
+[machines.desktop]
+host = "desktop"
+workdir = "/home/me/projects"
+```
+
+Notes:
+- Codex must be installed and on PATH on each machine.
+- Remote paths are not validated; make sure they exist.
+- Resume tokens are tracked per machine and restore the last known workdir for that machine.
 
 ## Security Notes
 This bot can run shell commands and edit files. Keep the bot token private and restrict `TELEGRAM_CHAT_ID`.
