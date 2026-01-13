@@ -43,6 +43,7 @@ network_access = true
 
 ## Commands
 - `/start`: confirm connectivity
+- `/help`: show the command list
 - `/reset`: reset the Codex session state
 - `/pwd`: show current working directory
 - `/cd <path>`: change working directory (supports relative paths)

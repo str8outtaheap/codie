@@ -1190,6 +1190,35 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    lines = [
+        "Commands:",
+        "/help - show this help message",
+        "/start - confirm connectivity",
+        "/reset - reset session state",
+        "/pwd - show current working directory",
+        "/cd <path> - change working directory",
+        "/status - show session state",
+        "/machine - list machines",
+        "/machine <name> - switch machine",
+        "/machine current - show active machine",
+        "/proj - list project aliases",
+        "/proj <name> - switch to project alias",
+        "/proj <name> <path> - save project alias",
+        "/proj rm <name> - remove project alias",
+        "/pin <text> - set a pin note",
+        "/pin - show pin",
+        "/unpin - clear pin",
+        "/run <command> - run a shell command",
+        "",
+        "Resume:",
+        "Send `codex resume <token>` to continue a session.",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
@@ -1401,10 +1430,12 @@ def main() -> None:
     application.add_handler(CommandHandler("pwd", pwd_cmd))
     application.add_handler(CommandHandler("cd", cd_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("machine", machine_cmd))
     application.add_handler(CommandHandler("proj", proj_cmd))
     application.add_handler(CommandHandler("pin", pin_cmd))
     application.add_handler(CommandHandler("unpin", unpin_cmd))
     application.add_handler(CommandHandler("run", run_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(
         MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, on_message)
     )
